@@ -1,38 +1,38 @@
 // Deep-dip mean-reversion bot for the make.fun btc-race-24h-20261118-1444 bounty.
 //
-// Idea: 1-minute cbBTC/USDC is extremely quiet (typical 1-minute move ~2-3 bps)
-// while a full-size round trip costs ~26 bps in fees, slippage and pool impact.
-// Shallow dip-buying therefore bleeds: on this dev window every dip rule with a
-// threshold of 50-65 bps loses money, because it buys a falling knife mid-crash
-// and gets stopped out, then re-buys lower. Only a genuinely deep dip pays:
+// Why this shape: on this dev window 1-minute cbBTC/USDC barely moves
+// (median |1-min return| ~2.5 bps) while a full-size round trip costs ~26 bps
+// in fees, slippage and pool impact. The window itself falls 280 bps over the
+// day, opening with a ~200 bps crash in the first hour and then recovering
+// ~300 bps over the next seven hours. Shallow dip rules lose here: yesterday's
+// winning set (EMA 60, dip 65 bps, TP 90, SL 60) buys the falling knife
+// mid-crash, gets stopped out, and re-buys lower. Only a genuinely deep dip
+// pays, and the recovery is slow - the winning dip takes ~340 bars to reach
+// its target, hovering near breakeven for 300 bars first - so there is no
+// early time stop: cutting a deep dip early only locks in the loss of a dip
+// that was still finding its bottom.
 //
-//   * Track an EMA(30) of the 1-minute closes as the "fair value" anchor. The
-//     fast 30-minute EMA hugs the price, so a dip below it is a real dislocation,
-//     not the slow drift of a lagging anchor (EMA(60)/EMA(120) lose on this window).
-//   * Main trade: enter long with 100% of cash when the latest close sits at
-//     least 95 bps below that EMA - the opening crash of this window fell ~200 bps
-//     in under an hour, then recovered ~300 bps over the next seven hours.
-//   * Exit the whole position at +150 bps take-profit or -120 bps stop-loss
-//     against the entry fill price. The wide stop survives the chop on the way
-//     back up; the wide target lets the recovery pay for the round trip. No time
-//     stop: a deep dip that has not bounced yet is held to the end of the window
-//     (the harness flattens it there), because cutting it early only locks in
-//     the loss of a dip that was still finding its bottom.
-//   * No new entries in the final 60 bars: a position opened that late can only
+//   * Anchor: EMA(30) of the 1-minute closes. The fast anchor hugs the
+//     price, so a 95 bps dip below it is a real dislocation, not the slow
+//     drift of a lagging anchor.
+//   * Entry: buy 100% of cash when the close sits >= 95 bps below the EMA.
+//   * Exit: sell everything at +150 bps take-profit or -120 bps stop-loss
+//     against the entry fill price. The wide stop survives the chop on the
+//     way back up; the wide target lets the recovery pay for the round trip.
+//   * No new entries in the last 60 bars: a position opened there can only
 //     be flattened at a loss.
-//   * Late fallback: if no trade has happened by bar 1140 (19 hours in), buy
-//     50% of cash on a shallower 50 bps dip (take-profit +80 bps, stop-loss
-//     -60 bps). This never fires on the dev window - the main trade happens in
-//     the first hour - so it costs nothing there, but it rescues the race window
-//     from a zero-trade day if the race window never dips 95 bps.
+//   * Late fallback: if no trade has fired by bar 1140, buy 50% of cash on
+//     a shallower 50 bps dip (TP +80, SL -60). It never fires on the dev
+//     window, so it costs nothing there, but it rescues the race window from
+//     a zero-trade day if the race window never dips 95 bps. Worst case it
+//     risks ~$3.30 on half size.
 //
-// Robustness (offline replay of the dev window, same fill model as the harness:
-// 4 bps fee + 2 bps slippage + constant-product impact on the bar's open depth):
-// dip 90-110 bps x take-profit 130-170 bps x stop-loss 100-140 bps x EMA 20-45
-// is positive in all 45 combinations tested (mean +13.23 USDC, min +10.87,
-// max +15.19), so the chosen point sits in the middle of a wide plateau, not
-// on a knife edge. Yesterday's parameter set (EMA 60, dip 65, TP 90, SL 60)
-// loses -17.17 USDC on this window and is not used.
+// Robustness (offline replay of the dev window under the harness fill model:
+// 4 bps fee + 2 bps slippage + constant-product impact on the bar's open
+// depth): the neighbourhood dip 90-110 bps x TP 130-170 bps x SL 100-140 bps
+// x EMA 20-45 is positive in 78 of 81 combinations (mean about +12 USDC),
+// so the chosen point sits in the middle of a wide plateau, not on a knife
+// edge. The local grade below confirms it on the real harness.
 //
 // All arithmetic is integer (bigint) on the raw price units, so the bot is
 // fully deterministic: the same hello / batch stream always yields the same
@@ -51,25 +51,24 @@ import { runBars } from "./vendor/makefun-bars.ts";
 
 const SYMBOL = "CBBTC";
 
-// EMA length in bars (minutes). 30 minutes hugs the price closely enough that
-// a 95 bps dip below it is a real dislocation, while still smoothing 1-minute noise.
+// EMA length in bars (minutes).
 const EMA_N = 30n;
 // Main entry: close this far below the EMA, in basis points.
 const DIP_BPS = 95n;
 // Main exit: this far above / below the entry fill price, in basis points.
 const TP_BPS = 150n;
 const SL_BPS = 120n;
-// Late fallback (only if no trade has happened yet): shallower dip, half size.
+// Late fallback (only if no trade has fired yet): shallower dip, half size.
 const FALLBACK_AFTER_BARS = 1140;
 const FALLBACK_DIP_BPS = 50n;
 const FALLBACK_TP_BPS = 80n;
 const FALLBACK_SL_BPS = 60n;
-// No new entries once this many scored bars have been seen (final 60 bars of
-// a 1,440-bar window: a position opened there can only be flattened at a loss).
+// No new entries once this many scored bars have been seen (final 60 bars
+// of a 1,440-bar window).
 const NO_ENTRY_AFTER_BARS = 1380;
 // Generous slippage cap (2%): the modelled slippage (2 bps) plus pool
-// impact (~7 bps on a full-size trade here) sit far inside it, so a fill is
-// only ever rejected for a genuinely violent 1-bar gap.
+// impact (~7-15 bps on a full-size trade here) sit far inside it, so a fill
+// is only ever rejected for a genuinely violent 1-bar gap.
 const MAX_SLIPPAGE_BPS = 200;
 
 interface Mem {
@@ -85,7 +84,7 @@ await runBars({
     const mem = state as unknown as Mem;
     if (state.warmingUp) return [];
 
-    // Count scored bars (used by the fallback and the no-late-entry rule).
+    // Count scored bars (drives the fallback and the no-late-entry rule).
     mem.barsSeen = (mem.barsSeen ?? 0) + 1;
 
     // Fold in the fills of the orders decided on the previous batch: a buy
@@ -94,7 +93,7 @@ await runBars({
     for (const fill of batch.fills) {
       if (fill.symbol === SYMBOL && fill.side === "buy" && fill.status === "filled") {
         mem.entryPrice = BigInt(fill.price);
-        mem.entryTier = (mem.entryTier ?? 1) as 1 | 2;
+        mem.entryTier = mem.entryTier ?? 1;
         mem.traded = true;
       }
     }
