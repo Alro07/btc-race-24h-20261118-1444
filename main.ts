@@ -19,8 +19,12 @@
 //   * Exit: sell everything at +150 bps take-profit or -120 bps stop-loss
 //     against the entry fill price. The wide stop survives the chop on the
 //     way back up; the wide target lets the recovery pay for the round trip.
-//   * No new entries in the last 60 bars: a position opened there can only
-//     be flattened at a loss.
+//   * One entry per dip episode: after any exit the bot disarms and only
+//     re-arms once the close has climbed back to within 50 bps of the EMA.
+//     Without this a stop-loss exit while the knife is still falling would
+//     re-buy the same dip on the next bar and stop out again - the exact
+//     churn the shallow rules die from. On the dev window this never fires
+//     (only one dip episode exists), so it costs nothing there.
 //   * Late fallback: if no trade has fired by bar 1140, buy 50% of cash on
 //     a shallower 50 bps dip (TP +80, SL -60). It never fires on the dev
 //     window, so it costs nothing there, but it rescues the race window from
@@ -66,6 +70,9 @@ const FALLBACK_SL_BPS = 60n;
 // No new entries once this many scored bars have been seen (final 60 bars
 // of a 1,440-bar window).
 const NO_ENTRY_AFTER_BARS = 1380;
+// Re-arm level: after an exit, the close must climb back to within this
+// many bps of the EMA before a new entry is allowed (one entry per dip).
+const REARM_BPS = 50n;
 // Generous slippage cap (2%): the modelled slippage (2 bps) plus pool
 // impact (~7-15 bps on a full-size trade here) sit far inside it, so a fill
 // is only ever rejected for a genuinely violent 1-bar gap.
@@ -77,6 +84,7 @@ interface Mem {
   entryTier?: 1 | 2;
   traded?: boolean;
   barsSeen?: number;
+  armed?: boolean;
 }
 
 await runBars({
@@ -116,6 +124,13 @@ await runBars({
       // Flat: no entries in the final stretch of the window.
       if ((mem.barsSeen ?? 0) >= NO_ENTRY_AFTER_BARS) return [];
       const dipBps = ((ema - close) * 10000n) / ema;
+      // Re-arm: after an exit, only a climb back to within REARM_BPS of the
+      // EMA re-enables entries, so one dip episode gets one entry, never a
+      // stop-loss followed by an immediate re-buy of the same falling knife.
+      if ((mem.armed ?? true) === false) {
+        if (dipBps < REARM_BPS) mem.armed = true;
+        return [];
+      }
       if (dipBps >= DIP_BPS && state.cash > 0n) {
         // Main trade: the deep dip, full size.
         mem.entryTier = 1;
@@ -160,6 +175,9 @@ await runBars({
     if (retBps >= tp || retBps <= -sl) {
       mem.entryPrice = undefined;
       mem.entryTier = undefined;
+      // Disarm: this dip episode is over; re-entry needs a fresh climb
+      // back toward the EMA first (see the flat branch).
+      mem.armed = false;
       return [
         {
           side: "sell",
